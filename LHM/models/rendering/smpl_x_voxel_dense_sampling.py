@@ -1224,6 +1224,48 @@ class SMPLXVoxelMeshModel(nn.Module):
             transform_mat_vertex, transform_mat_null_vertex
         )  # [B, N, 4, 4]
 
+        
+        pth_path = "/data1/users/adrian/LHM/exps/gaussians/lhm_output_data.pth"
+        print(f"Calculando y guardando todas las características estáticas en {pth_path}...")
+
+        gaussianos_canonicos_alineados = null_mean3d_blendshape.detach().clone()
+        esqueleto_canonico_alineado = joint_null_pose.detach().clone()
+        fix_mask = (
+        ((self.is_rhand + self.is_lhand + self.is_face) > 0)
+        .unsqueeze(0)
+        .repeat(batch_size, 1)
+        )
+        query_skinning = self.query_voxel_skinning_weights(mean_3d)  # [B, N, J]
+        skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, N, J]
+        query_skinning[fix_mask] = skinning_weight[fix_mask]  # sobrescribe en zonas especiales
+
+        smplx_40k_features = {
+            "pose_dirs": self.pose_dirs.detach().clone(),
+            "expr_dirs": self.expr_dirs.detach().clone(),
+            "shape_dirs": self.shape_dirs.detach().clone(),
+            "is_rhand": self.is_rhand.detach().clone(),
+            "is_lhand": self.is_lhand.detach().clone(),
+            "is_face": self.is_face.detach().clone(),
+            "is_face_expr": self.is_face_expr.detach().clone(),
+            "is_lower_body": self.is_lower_body.detach().clone(),
+            "is_upper_body": self.is_upper_body.detach().clone(),
+            "is_constrain_body": self.is_constrain_body.detach().clone(),
+            "is_cavity": self.is_cavity.detach().clone(),
+            "position_init": gaussianos_canonicos_alineados[0],
+            "skeleton_canonical": esqueleto_canonico_alineado[0],
+            "lbs_weights": query_skinning,
+            "smplx_parents": self.smplx_layer.parents.clone(),
+        }
+        
+        if not os.path.exists(pth_path):
+            original_dict = {}
+        else:
+            original_dict = torch.load(pth_path)
+        original_dict.update(smplx_40k_features)
+
+        torch.save(original_dict, pth_path)
+
+
         return posed_mean_3d, neutral_to_posed_vertex
 
     def get_query_points(self, smplx_data, device):
@@ -1496,6 +1538,20 @@ class SMPLXVoxelMeshModel(nn.Module):
         _, transform_mat_neutral_pose = batch_rigid_transform(
             pose[:, :, :, :], joint_neutral_pose[:, :, :], self.smplx_layer.parents
         )  # [B, 55, 4, 4]
+
+        path = "/data1/users/adrian/LHM/exps/gaussians/lhm_output_data.pth"
+        if not os.path.exists(path):
+            original_dict = {}
+        else:
+            original_dict = torch.load(path)
+        LHM_mesh_neutral_pose_dict={
+            "mesh_neutral_pose": mesh_neutral_pose.detach().cpu(),
+            "transform_mat_neutral_pose": transform_mat_neutral_pose.detach().cpu(),
+        }
+        original_dict.update(LHM_mesh_neutral_pose_dict)
+
+        torch.save(original_dict, path)
+        
 
         return (
             mesh_neutral_pose_upsampled,
