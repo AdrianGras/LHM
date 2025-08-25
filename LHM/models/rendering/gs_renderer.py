@@ -25,7 +25,7 @@ from LHM.models.rendering.utils.typing import *
 from LHM.models.rendering.utils.utils import MLP, trunc_exp
 from LHM.models.utils import LinerParameterTuner, StaticParameterTuner
 from LHM.outputs.output import GaussianAppOutput
-
+from tools.cvt_LHM_mesh_output import pack_gaussian_asset_and_pos
 
 def auto_repeat_size(tensor, repeat_num, axis=0):
     repeat_size = [1] * tensor.dim()
@@ -1364,6 +1364,7 @@ class GS3DRenderer(nn.Module):
         background_color,
         debug=False,
         df_data=None,  # deepfashion-style dataset
+        save_gs_model_path=None, 
     ):
         batch_size = len(gs_attr_list)
         out_list = []
@@ -1384,8 +1385,14 @@ class GS3DRenderer(nn.Module):
 
             animatable_gs_model_list = merge_animatable_gs_model_list[:N_view]
 
+            if save_gs_model_path is not None:
+                print("in gs_renderer/forward_animate_gs", type(animatable_gs_model_list[0]), animatable_gs_model_list[0].xyz.shape)
+                pack_gaussian_asset_and_pos(merge_animatable_gs_model_list, query_pt, save_gs_model_path, "GaussianModel")
+
+
             assert len(animatable_gs_model_list) == c2w.shape[1]
 
+            eye4 = torch
             # gs render animated gs model.
             out_list.append(
                 self.forward_single_batch(
@@ -1461,244 +1468,3 @@ class GS3DRenderer(nn.Module):
 
         return out
 
-
-def test():
-    import cv2
-
-    human_model_path = "./pretrained_models/human_model_files"
-    smplx_data_root = "/data1/projects/ExAvatar_RELEASE/avatar/data/Custom/data/gyeongsik/smplx_optimized/smplx_params_smoothed"
-    shape_param_file = "/data1/projects/ExAvatar_RELEASE/avatar/data/Custom/data/gyeongsik/smplx_optimized/shape_param.json"
-
-    batch_size = 1
-    device = "cuda"
-    smplx_data, cam_param_list, ori_image_list = read_smplx_param(
-        smplx_data_root=smplx_data_root, shape_param_file=shape_param_file, batch_size=2
-    )
-    smplx_data_tmp = smplx_data
-    for k, v in smplx_data.items():
-        smplx_data_tmp[k] = v.unsqueeze(0)
-        if (k == "betas") or (k == "face_offset") or (k == "joint_offset"):
-            smplx_data_tmp[k] = v[0].unsqueeze(0)
-    smplx_data = smplx_data_tmp
-
-    gs_render = GS3DRenderer(
-        human_model_path=human_model_path,
-        subdivide_num=2,
-        smpl_type="smplx",
-        feat_dim=64,
-        query_dim=64,
-        use_rgb=False,
-        sh_degree=3,
-        mlp_network_config=None,
-        xyz_offset_max_step=1.8 / 32,
-    )
-
-    gs_render.to(device)
-    # print(cam_param_list[0])
-
-    c2w_list = []
-    intr_list = []
-    for cam_param in cam_param_list:
-        c2w = torch.eye(4).to(device)
-        c2w[:3, :3] = cam_param["R"]
-        c2w[:3, 3] = cam_param["t"]
-        c2w_list.append(c2w)
-        intr = torch.eye(4).to(device)
-        intr[0, 0] = cam_param["focal"][0]
-        intr[1, 1] = cam_param["focal"][1]
-        intr[0, 2] = cam_param["princpt"][0]
-        intr[1, 2] = cam_param["princpt"][1]
-        intr_list.append(intr)
-
-    c2w = torch.stack(c2w_list).unsqueeze(0)
-    intrinsic = torch.stack(intr_list).unsqueeze(0)
-
-    out = gs_render.forward(
-        gs_hidden_features=torch.zeros((batch_size, 2048, 64)).float().to(device),
-        query_points=None,
-        smplx_data=smplx_data,
-        c2w=c2w,
-        intrinsic=intrinsic,
-        height=int(cam_param_list[0]["princpt"][1]) * 2,
-        width=int(cam_param_list[0]["princpt"][0]) * 2,
-        background_color=torch.tensor([1.0, 1.0, 1.0])
-        .float()
-        .view(1, 1, 3)
-        .repeat(batch_size, 2, 1)
-        .to(device),
-        debug=False,
-    )
-
-    for k, v in out.items():
-        if k == "comp_rgb_bg":
-            print("comp_rgb_bg", v)
-            continue
-        for b_idx in range(len(v)):
-            if k == "3dgs":
-                for v_idx in range(len(v[b_idx])):
-                    v[b_idx][v_idx].save_ply(f"./debug_vis/{b_idx}_{v_idx}.ply")
-                continue
-            for v_idx in range(v.shape[1]):
-                save_path = os.path.join("./debug_vis", f"{b_idx}_{v_idx}_{k}.jpg")
-                cv2.imwrite(
-                    save_path,
-                    (v[b_idx, v_idx].detach().cpu().numpy() * 255).astype(np.uint8),
-                )
-
-
-def test1():
-    import cv2
-
-    human_model_path = "./pretrained_models/human_model_files"
-    device = "cuda"
-
-    # root_dir = "/data1/projects/ExAvatar_RELEASE/avatar/data/Custom/data"
-    # meta_path = "/data1/projects/ExAvatar_RELEASE/avatar/data/Custom/data/data_list.json"
-    # dataset = ExAvatarDataset(root_dirs=root_dir, meta_path=meta_path, sample_side_views=3,
-    #                 render_image_res_low=384, render_image_res_high=384,
-    #                 render_region_size=(224, 224), source_image_res=384)
-
-    # root_dir = "/data1/datasets1/3d_human_data/humman/humman_compressed"
-    # meta_path = "/data1/datasets1/3d_human_data/humman/humman_id_debug_list.json"
-    # dataset = HuMManDataset(root_dirs=root_dir, meta_path=meta_path, sample_side_views=3,
-    #                 render_image_res_low=384, render_image_res_high=384,
-    #                 render_region_size=(682, 384), source_image_res=384)
-
-    # from openlrm.datasets.static_human import StaticHumanDataset
-    # root_dir = "./train_data/static_human_data"
-    # meta_path = "./train_data/static_human_data/data_id_list.json"
-    # dataset = StaticHumanDataset(root_dirs=root_dir, meta_path=meta_path, sample_side_views=7,
-    #                 render_image_res_low=384, render_image_res_high=384,
-    #                 render_region_size=(682, 384), source_image_res=384,
-    #                 debug=False)
-
-    # from openlrm.datasets.singleview_human import SingleViewHumanDataset
-    # root_dir = "./train_data/single_view"
-    # meta_path = "./train_data/single_view/data_list.json"
-    # dataset = SingleViewHumanDataset(root_dirs=root_dir, meta_path=meta_path, sample_side_views=0,
-    #                 render_image_res_low=384, render_image_res_high=384,
-    #                 render_region_size=(682, 384), source_image_res=384,
-    #                 debug=False)
-
-    from accelerate.utils import set_seed
-
-    set_seed(1234)
-    from LHM.datasets.video_human import VideoHumanDataset
-
-    root_dir = "./train_data/ClothVideo"
-    meta_path = "./train_data/ClothVideo/label/valid_id_with_img_list.json"
-    dataset = VideoHumanDataset(
-        root_dirs=root_dir,
-        meta_path=meta_path,
-        sample_side_views=7,
-        render_image_res_low=384,
-        render_image_res_high=384,
-        render_region_size=(682, 384),
-        source_image_res=384,
-        enlarge_ratio=[0.85, 1.2],
-        debug=False,
-    )
-
-    data = dataset[0]
-
-    def get_smplx_params(data):
-        smplx_params = {}
-        smplx_keys = [
-            "root_pose",
-            "body_pose",
-            "jaw_pose",
-            "leye_pose",
-            "reye_pose",
-            "lhand_pose",
-            "rhand_pose",
-            "expr",
-            "trans",
-            "betas",
-        ]
-        for k, v in data.items():
-            if k in smplx_keys:
-                # print(k, v.shape)
-                smplx_params[k] = data[k]
-        return smplx_params
-
-    smplx_data = get_smplx_params(data)
-
-    smplx_data_tmp = {}
-    for k, v in smplx_data.items():
-        smplx_data_tmp[k] = v.unsqueeze(0).to(device)
-        print(k, v.shape)
-    smplx_data = smplx_data_tmp
-
-    c2ws = data["c2ws"].unsqueeze(0).to(device)
-    intrs = data["intrs"].unsqueeze(0).to(device)
-    render_images = data["render_image"].numpy()
-    render_h = data["render_full_resolutions"][0, 0]
-    render_w = data["render_full_resolutions"][0, 1]
-    render_bg_colors = data["render_bg_colors"].unsqueeze(0).to(device)
-    print("c2ws", c2ws.shape, "intrs", intrs.shape, intrs)
-
-    gs_render = GS3DRenderer(
-        human_model_path=human_model_path,
-        subdivide_num=2,
-        smpl_type="smplx",
-        feat_dim=64,
-        query_dim=64,
-        use_rgb=False,
-        sh_degree=3,
-        mlp_network_config=None,
-        xyz_offset_max_step=1.8 / 32,
-        expr_param_dim=10,
-        shape_param_dim=10,
-        fix_opacity=True,
-        fix_rotation=True,
-    )
-    gs_render.to(device)
-
-    out = gs_render.forward(
-        gs_hidden_features=torch.zeros((1, 2048, 64)).float().to(device),
-        query_points=None,
-        smplx_data=smplx_data,
-        c2w=c2ws,
-        intrinsic=intrs,
-        height=render_h,
-        width=render_w,
-        background_color=render_bg_colors,
-        debug=False,
-    )
-    os.makedirs("./debug_vis/gs_render", exist_ok=True)
-    for k, v in out.items():
-        if k == "comp_rgb_bg":
-            print("comp_rgb_bg", v)
-            continue
-        for b_idx in range(len(v)):
-            if k == "3dgs":
-                for v_idx in range(len(v[b_idx])):
-                    v[b_idx][v_idx].save_ply(
-                        f"./debug_vis/gs_render/{b_idx}_{v_idx}.ply"
-                    )
-                continue
-            for v_idx in range(v.shape[1]):
-                save_path = os.path.join(
-                    "./debug_vis/gs_render", f"{b_idx}_{v_idx}_{k}.jpg"
-                )
-                img = (
-                    v[b_idx, v_idx].permute(1, 2, 0).detach().cpu().numpy() * 255
-                ).astype(np.uint8)
-                print(img.shape, save_path)
-                if "mask" in k:
-                    render_img = render_images[v_idx].transpose(1, 2, 0) * 255
-                    cv2.imwrite(
-                        save_path,
-                        np.hstack(
-                            [np.tile(img, (1, 1, 3)), render_img.astype(np.uint8)]
-                        ),
-                    )
-                else:
-                    cv2.imwrite(save_path, img)
-
-
-if __name__ == "__main__":
-    # test1()
-    test()
-    test()
-    test()

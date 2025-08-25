@@ -258,6 +258,7 @@ class SMPLX_Mesh(object):
         self.body_head_mapping = self.get_body_face_mapping()
 
         self.register_constrain_prior()
+
     
     def upper_body_label(self):
 
@@ -503,7 +504,8 @@ class SMPLXVoxelMeshModel(nn.Module):
             cano_pose_type=cano_pose_type,
         )
         self.smplx_layer = copy.deepcopy(self.smpl_x.layer[gender])
-
+        self.save1 = False
+        self.save2 = False
         # register
         self.apply_pose_blendshape = apply_pose_blendshape
         self.cano_pose_type = cano_pose_type
@@ -1025,19 +1027,34 @@ class SMPLXVoxelMeshModel(nn.Module):
         # trans = smplx_param['trans']
 
         # forward kinematics
+        if len(root_pose.shape) == 2:
+            pose = torch.cat(
+                (
+                    root_pose.unsqueeze(1),
+                    body_pose,
+                    jaw_pose.unsqueeze(1),
+                    leye_pose.unsqueeze(1),
+                    reye_pose.unsqueeze(1),
+                    lhand_pose,
+                    rhand_pose,
+                ),
+                dim=1,
+            )  # [B, 55, 3]
+        else:
+            pose = torch.cat(
+                (
+                    root_pose,
+                    body_pose,
+                    jaw_pose,
+                    leye_pose,
+                    reye_pose,
+                    lhand_pose,
+                    rhand_pose,
+                ),
+                dim=1,
+            )
 
-        pose = torch.cat(
-            (
-                root_pose.unsqueeze(1),
-                body_pose,
-                jaw_pose.unsqueeze(1),
-                leye_pose.unsqueeze(1),
-                reye_pose.unsqueeze(1),
-                lhand_pose,
-                rhand_pose,
-            ),
-            dim=1,
-        )  # [B, 55, 3]
+        
         pose = axis_angle_to_matrix(pose)  # [B, 55, 3, 3]
         posed_joints, transform_mat_joint_2 = batch_rigid_transform(
             pose[:, :, :, :], joint_zero_pose[:, :, :], self.smplx_layer.parents
@@ -1193,13 +1210,16 @@ class SMPLXVoxelMeshModel(nn.Module):
             mean_3d, transform_mat_null_vertex, torch.zeros_like(smplx_data["trans"])
         )  # posed with smplx_param
 
+        extended_shape = torch.zeros(shape_param.shape[0], self.smpl_x.shape_param_dim).to(device)
+        extended_shape[:, : shape_param.shape[1]] = shape_param
+
         # blend_shape offset
-        blend_shape_offset = blend_shapes(shape_param, self.shape_dirs)
+        blend_shape_offset = blend_shapes(extended_shape, self.shape_dirs)
         null_mean3d_blendshape = null_mean_3d + blend_shape_offset
 
         # get transformation matrix of the nearest vertex and perform lbs
         joint_null_pose = self.get_zero_pose_human(
-            shape_param=shape_param,  # target shape
+            shape_param=extended_shape,  # target shape
             device=device,
             face_offset=face_offset,
             joint_offset=joint_offset,
@@ -1224,20 +1244,69 @@ class SMPLXVoxelMeshModel(nn.Module):
             transform_mat_vertex, transform_mat_null_vertex
         )  # [B, N, 4, 4]
 
-        
-        pth_path = "/data1/users/adrian/LHM/exps/gaussians/lhm_output_data.pth"
-        print(f"Calculando y guardando todas las características estáticas en {pth_path}...")
+        if not self.save1:
+            pth_path = "/data1/users/adrian/LHM/exps/gaussians/lhm_output_data.pth"
+            print(f"Calculando y guardando todas las características estáticas en {pth_path}...")
 
-        gaussianos_canonicos_alineados = null_mean3d_blendshape.detach().clone()
-        esqueleto_canonico_alineado = joint_null_pose.detach().clone()
-        fix_mask = (
-        ((self.is_rhand + self.is_lhand + self.is_face) > 0)
-        .unsqueeze(0)
-        .repeat(batch_size, 1)
+            gaussianos_canonicos_alineados = null_mean3d_blendshape.detach().clone()
+            esqueleto_canonico_alineado = joint_null_pose.detach().clone()
+            fix_mask = (
+            ((self.is_rhand + self.is_lhand + self.is_face) > 0)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+            )
+            query_skinning = self.query_voxel_skinning_weights(mean_3d)  # [B, N, J]
+            skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, N, J]
+            query_skinning[fix_mask] = skinning_weight[fix_mask]  # sobrescribe en zonas especiales
+
+            smplx_40k_features = {
+                "pose_dirs": self.pose_dirs.detach().clone(),
+                "expr_dirs": self.expr_dirs.detach().clone(),
+                "shape_dirs": self.shape_dirs.detach().clone(),
+                "is_rhand": self.is_rhand.detach().clone(),
+                "is_lhand": self.is_lhand.detach().clone(),
+                "is_face": self.is_face.detach().clone(),
+                "is_face_expr": self.is_face_expr.detach().clone(),
+                "is_lower_body": self.is_lower_body.detach().clone(),
+                "is_upper_body": self.is_upper_body.detach().clone(),
+                "is_constrain_body": self.is_constrain_body.detach().clone(),
+                "is_cavity": self.is_cavity.detach().clone(),
+                "position_init": gaussianos_canonicos_alineados[0],
+                "skeleton_canonical": esqueleto_canonico_alineado[0],
+                "lbs_weights": query_skinning[0],
+                "smplx_parents": self.smplx_layer.parents.clone(),
+            }
+            
+            if not os.path.exists(pth_path):
+                original_dict = {}
+            else:
+                original_dict = torch.load(pth_path)
+            original_dict.update(smplx_40k_features)
+
+            torch.save(original_dict, pth_path)
+            self.save1 = True
+
+
+        return posed_mean_3d, neutral_to_posed_vertex
+    
+    def get_smplx_features(self, mean_3d, betas):
+        device = mean_3d.device
+        extended_shape = torch.zeros(1, self.smpl_x.shape_param_dim).to(device)
+        extended_shape[:, : len(betas)] = betas
+        esqueleto_canonico_alineado =  self.get_zero_pose_human(
+            shape_param=extended_shape, 
+            device=device,
+            face_offset=None,
+            joint_offset=None,
         )
-        query_skinning = self.query_voxel_skinning_weights(mean_3d)  # [B, N, J]
-        skinning_weight = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, N, J]
-        query_skinning[fix_mask] = skinning_weight[fix_mask]  # sobrescribe en zonas especiales
+        fix_mask = (self.is_rhand + self.is_lhand + self.is_face) > 0
+       
+        query_skinning = self.query_voxel_skinning_weights(mean_3d).squeeze()
+        query_skinning[fix_mask] = self.skinning_weight [fix_mask]  
+
+        _, _, transform_mat_neutral_pose = self.get_query_points(
+            {"betas": betas.unsqueeze(dim=0)}, device
+        )
 
         smplx_40k_features = {
             "pose_dirs": self.pose_dirs.detach().clone(),
@@ -1251,22 +1320,15 @@ class SMPLXVoxelMeshModel(nn.Module):
             "is_upper_body": self.is_upper_body.detach().clone(),
             "is_constrain_body": self.is_constrain_body.detach().clone(),
             "is_cavity": self.is_cavity.detach().clone(),
-            "position_init": gaussianos_canonicos_alineados[0],
-            "skeleton_canonical": esqueleto_canonico_alineado[0],
+            "skeleton_canonical": esqueleto_canonico_alineado.squeeze(0),
             "lbs_weights": query_skinning,
             "smplx_parents": self.smplx_layer.parents.clone(),
+            "transform_mat_neutral_pose": transform_mat_neutral_pose,
         }
-        
-        if not os.path.exists(pth_path):
-            original_dict = {}
-        else:
-            original_dict = torch.load(pth_path)
-        original_dict.update(smplx_40k_features)
-
-        torch.save(original_dict, pth_path)
-
-
-        return posed_mean_3d, neutral_to_posed_vertex
+        return smplx_40k_features
+            
+    
+    
 
     def get_query_points(self, smplx_data, device):
         """transform_mat_neutral_pose is function to warp pre-defined posed to zero-pose"""
@@ -1539,18 +1601,20 @@ class SMPLXVoxelMeshModel(nn.Module):
             pose[:, :, :, :], joint_neutral_pose[:, :, :], self.smplx_layer.parents
         )  # [B, 55, 4, 4]
 
-        path = "/data1/users/adrian/LHM/exps/gaussians/lhm_output_data.pth"
-        if not os.path.exists(path):
-            original_dict = {}
-        else:
-            original_dict = torch.load(path)
-        LHM_mesh_neutral_pose_dict={
-            "mesh_neutral_pose": mesh_neutral_pose.detach().cpu(),
-            "transform_mat_neutral_pose": transform_mat_neutral_pose.detach().cpu(),
-        }
-        original_dict.update(LHM_mesh_neutral_pose_dict)
+        if not self.save2:
+            path = "/data1/users/adrian/LHM/exps/gaussians/lhm_output_data.pth"
+            if not os.path.exists(path):
+                original_dict = {}
+            else:
+                original_dict = torch.load(path)
+            LHM_mesh_neutral_pose_dict={
+                "mesh_neutral_pose": mesh_neutral_pose.detach().cpu(),
+                "transform_mat_neutral_pose": transform_mat_neutral_pose.detach().cpu(),
+            }
+            original_dict.update(LHM_mesh_neutral_pose_dict)
 
-        torch.save(original_dict, path)
+            torch.save(original_dict, path)
+            self.save2 = True
         
 
         return (

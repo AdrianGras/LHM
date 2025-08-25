@@ -11,7 +11,8 @@ import sys
 sys.path.append("./")
 
 import pdb
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, Dict
 
 import numpy as np
 import torch
@@ -20,17 +21,21 @@ from PIL import Image
 
 from engine.ouputs import BaseOutput
 from engine.pose_estimation.model import load_model
+from scipy.spatial.transform import Rotation as ScipyRotation
+from typing import Optional, Dict, Any
 
 IMG_NORM_MEAN = [0.485, 0.456, 0.406]
 IMG_NORM_STD = [0.229, 0.224, 0.225]
 
 
 @dataclass
-class SMPLXOutput(BaseOutput):
-    beta: np.ndarray
+class SMPLXOutput:
+    beta: Optional[np.ndarray]
     is_full_body: bool
-    ratio: float
+    ratio: Optional[float]
     msg: str
+    camera_data: Optional[Dict[str, Any]] = None  # Cámara en el "mundo real"
+    smplx_params: Optional[Dict[str, Any]] = None # Parámetros SMPLX en el mundo "canónico"
 
 
 def normalize_rgb_tensor(img, imgenet_normalization=True):
@@ -40,6 +45,22 @@ def normalize_rgb_tensor(img, imgenet_normalization=True):
             img - torch.tensor(IMG_NORM_MEAN, device=img.device).view(1, 3, 1, 1)
         ) / torch.tensor(IMG_NORM_STD, device=img.device).view(1, 3, 1, 1)
     return img
+
+def get_projection_matrix_numpy(znear, zfar, tanfovx, tanfovy):
+    """
+    Crea una matriz de proyección con la convención que espera el rasterizador.
+    Versión NumPy para usar dentro de la clase.
+    """
+    P = np.zeros((4, 4))
+    
+    # Esta es la estructura que nos funcionó antes
+    P[0, 0] = 1.0 / tanfovx
+    P[1, 1] = 1.0 / tanfovy
+    P[2, 2] = (zfar + znear) / (zfar - znear)
+    P[2, 3] = - (2 * zfar * znear) / (zfar - znear)
+    P[3, 2] = 1.0 # o -1.0 dependiendo de la dirección Z, pero esta es la estructura
+    
+    return P
 
 
 class PoseEstimator:
@@ -180,5 +201,99 @@ class PoseEstimator:
             beta=target_human[0]["shape"].cpu().numpy(),
             is_full_body=is_full_body,
             ratio=visible_ratio.cpu().item(),
+            msg="success" if is_full_body else "no full-body human detected",
+        )
+
+class FullPoseEstimator(PoseEstimator):
+    """
+    Calcula y devuelve tanto los parámetros de la cámara en el "mundo real"
+    como los parámetros SMPLX completos para un mundo "canónico" centrado en la cámara.
+    """
+    def _build_real_world_camera(self, human_data, img_width, img_height, near_clip=0.1, far_clip=100.0):
+        """
+        Calcula los parámetros de la cámara en el mundo real, como se hacía originalmente.
+        """
+        t_subject_in_cam = human_data['transl'].cpu().numpy().flatten()
+        rotvec_subject_in_cam = human_data['rotvec'][0].cpu().numpy()
+        R_subject_in_cam = ScipyRotation.from_rotvec(rotvec_subject_in_cam).as_matrix()
+
+        R_cam_in_world = R_subject_in_cam.T
+        t_cam_in_world = -R_cam_in_world @ t_subject_in_cam
+
+        view_matrix = np.eye(4)
+        view_matrix[:3, :3] = R_cam_in_world.T 
+        view_matrix[:3, 3] = -R_cam_in_world.T @ t_cam_in_world
+        
+        fov_rad = np.radians(self.fov)
+        tanfovy = np.tan(fov_rad / 2.0)
+        tanfovx = tanfovy * (img_width / img_height)
+        
+        proj_matrix = get_projection_matrix_numpy(near_clip, far_clip, tanfovx, tanfovy)
+        proj_matrix = proj_matrix.T 
+
+        return {
+            "camera_position": torch.from_numpy(t_cam_in_world).float(),
+            "view_matrix": torch.from_numpy(view_matrix).float(),
+            "proj_matrix": torch.from_numpy(proj_matrix).float(),
+            "tanfovx": float(tanfovx),
+            "tanfovy": float(tanfovy),
+            "height": int(img_height),
+            "width": int(img_width),
+        }
+
+    def _extract_smplx_params(self, human_data):
+        output = {
+            "betas": human_data["shape"],
+            "trans": human_data["transl"],
+            "root_pose": human_data["rotvec"][0],
+            "body_pose": human_data["rotvec"][1:],
+            "expression": human_data["expression"],
+        }
+
+        return output
+
+    @torch.no_grad()
+    def __call__(self, img_path):
+        """Sobrescribe el método base para devolver ambos conjuntos de datos."""
+        img_np = np.asarray(Image.open(img_path).convert("RGB"))
+        raw_h, raw_w, _ = img_np.shape
+
+        img_np_padded, offset_w, offset_h = self.img_center_padding(img_np)
+        img_tensor, annotation = self._preprocess(img_np_padded)
+        K = self.get_camera_parameters()
+
+        with torch.cuda.amp.autocast(enabled=True):
+            target_human = self.mhmr_model(
+                img_tensor, is_training=False, nms_kernel_size=int(3), det_thresh=0.3, K=K, idx=None, max_dist=None
+            )
+        
+        if not target_human or not len(target_human) == 1:
+            return SMPLXOutput(
+                beta=None, is_full_body=False, ratio=None, msg="No human or multiple humans detected"
+            )
+        
+        human_data = target_human[0]
+        
+        pad_left, pad_top, scale_factor, _, _ = annotation
+        j2d = human_data["j2d"]
+        j2d = (j2d - torch.tensor([pad_left, pad_top], device=self.device)) / scale_factor
+        j2d = j2d - torch.tensor([offset_w, offset_h], device=self.device)
+        top = j2d[..., 1].min()
+        bottom = j2d[..., 1].max()
+        full_body_length = bottom - top
+        visible_body_length = min(raw_h, bottom) - max(0, top)
+        visible_ratio = visible_body_length / full_body_length if full_body_length > 0 else 0
+        is_full_body = visible_ratio.cpu().item() >= 0.4
+
+        # --- CALCULAR AMBOS CONJUNTOS DE DATOS ---
+        camera_data_real_world = self._build_real_world_camera(human_data, raw_w, raw_h)
+        smplx_params_canonical = self._extract_smplx_params(human_data)
+
+        return SMPLXOutput(
+            beta=human_data["shape"][0].cpu().numpy(),
+            is_full_body=is_full_body,
+            ratio=visible_ratio.cpu().item(),
+            camera_data=camera_data_real_world,
+            smplx_params=smplx_params_canonical,
             msg="success" if is_full_body else "no full-body human detected",
         )

@@ -6,6 +6,7 @@
 # @Function      : Inference code for human_lrm model
 
 import argparse
+from email.policy import strict
 import os
 import pdb
 import time
@@ -18,9 +19,9 @@ from omegaconf import OmegaConf
 from PIL import Image
 from tqdm.auto import tqdm
 
-from engine.pose_estimation.pose_estimator import PoseEstimator
+from engine.pose_estimation.pose_estimator import PoseEstimator, FullPoseEstimator
 from engine.SegmentAPI.base import Bbox
-
+from LHM.utils.merge_avatars import merge_avatars
 # from LHM.utils.model_download_utils import AutoModelQuery
 from LHM.utils.model_download_utils import AutoModelQuery
 
@@ -36,7 +37,7 @@ from LHM.datasets.cam_utils import (
     create_intrinsics,
     surrounding_views_linspace,
 )
-from LHM.models.modeling_human_lrm import ModelHumanLRM
+from LHM.models.modeling_human_lrm import ModelHumanLRM, ModelHumanLRMSapdinoBodyHeadSD3_5
 from LHM.runners import REGISTRY_RUNNERS
 from LHM.runners.infer.utils import (
     calc_new_tgt_size_by_aspect,
@@ -52,6 +53,19 @@ from LHM.utils.ffmpeg_utils import images_to_video
 from LHM.utils.hf_hub import wrap_model_hub
 from LHM.utils.logging import configure_logger
 from LHM.utils.model_card import MODEL_CARD, MODEL_CONFIG
+
+from diff_gaussian_rasterization import (
+    GaussianRasterizationSettings,
+    GaussianRasterizer,
+)
+from scipy.spatial.transform import Rotation as R
+
+import math
+from LHM.models.rendering.smpl_x_voxel_dense_sampling import SMPLXVoxelMeshModel
+from pytorch3d.transforms import matrix_to_quaternion
+from pytorch3d.transforms.rotation_conversions import quaternion_multiply
+from scipy.spatial.transform import Rotation as R
+
 
 
 def download_geo_files():
@@ -170,7 +184,6 @@ def infer_preprocess_image(
     """
 
     rgb = np.array(Image.open(rgb_path))
-    rgb_raw = rgb.copy()
 
     bbox = get_bbox(mask)
     bbox_list = bbox.get_box()
@@ -325,6 +338,7 @@ def parse_configs():
         cfg.image_dump = os.path.join("exps", "images", _relative_path)
         cfg.video_dump = os.path.join("exps", "videos", _relative_path)  # output path
         cfg.mesh_dump = os.path.join("exps", "meshs", _relative_path)  # output path
+        cfg.gs_model_dump = os.path.join("exps", "gaussians")  # output path
 
     if args.infer is not None:
         cfg_infer = OmegaConf.load(args.infer)
@@ -379,16 +393,16 @@ class HumanLRMInferrer(Inferrer):
         except:
             self.parsingnet = None 
 
-        self.model: ModelHumanLRM = self._build_model(self.cfg).to(self.device)
-
+        self.model: ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model(self.cfg).to(self.device)
         self.motion_dict = dict()
 
     def _build_model(self, cfg):
         from LHM.models import model_dict
 
         hf_model_cls = wrap_model_hub(model_dict[self.EXP_TYPE])
-
-        model = hf_model_cls.from_pretrained(cfg.model_name)
+        print("model name:", cfg.model_name)
+        
+        model = hf_model_cls.from_pretrained(cfg.model_name,strict=False)
         return model
 
     def _default_source_camera(
@@ -624,7 +638,8 @@ class HumanLRMInferrer(Inferrer):
         dump_video_path: str,
         shape_param=None,
     ):
-
+        image_name = os.path.basename(image_path)
+        uid = image_name.split(".")[0]
         source_size = self.cfg.source_size
         render_size = self.cfg.render_size
         # render_views = self.cfg.render_views
@@ -771,7 +786,24 @@ class HumanLRMInferrer(Inferrer):
                     batch_smplx_params[key] = motion_seq["smplx_params"][key][
                         :, batch_i : batch_i + batch_size
                     ].to(device)
+                """batch_smplx_params["body_pose"] = torch.tensor([[ 0.0000,  0.0000,  0.3491,  0.0000,  0.0000, -0.3491,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,
+                0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000]]).view(21,3).repeat(batch_size,1,1).to(device).unsqueeze(0)
+                        
+                        
 
+                batch_smplx_params["root_pose"] = torch.zeros(1, batch_size, 3).to(device)"""
+
+                if batch_i == 0:
+                    output_path = os.path.join(self.cfg.gs_model_dump ,f"{uid}_LHM_w_Exavt_neutral_pose_gs_test.pth")
+                    print("will save gs model to ", output_path)
+                else:
+                    output_path = None
                 # def animation_infer(self, gs_model_list, query_points, smplx_params, render_c2ws, render_intrs, render_bg_colors, render_h, render_w):
                 res = self.model.animation_infer(gs_model_list, query_points, batch_smplx_params,
                     render_c2ws=motion_seq["render_c2ws"][
@@ -783,6 +815,8 @@ class HumanLRMInferrer(Inferrer):
                     render_bg_colors=motion_seq["render_bg_colors"][
                         :, batch_i : batch_i + batch_size
                     ].to(device),
+                    save_gs_model_path= output_path,
+
                     )
 
             comp_rgb = res["comp_rgb"] # [Nv, H, W, 3], 0-1
@@ -833,9 +867,7 @@ class HumanLRMInferrer(Inferrer):
         ]
 
 
-        for image_path in tqdm(image_paths,
-            disable=not self.accelerator.is_local_main_process,
-        ):
+        for image_path in [image_paths[0]]: #tqdm(image_paths,disable=not self.accelerator.is_local_main_process,):
 
             # prepare dump paths
             image_name = os.path.basename(image_path)
@@ -1124,3 +1156,491 @@ class HumanLRMVideoInferrer(HumanLRMInferrer):
                 dump_image_dir=dump_image_dir,
                 dump_video_path=dump_video_path,
             )
+
+
+@REGISTRY_RUNNERS.register("infer.human_lrm_multiview")
+class HumanLRMInferrerMultiview(Inferrer):
+
+    EXP_TYPE: str = "human_lrm_sapdino_bh_sd3_5"
+
+    def __init__(self):
+        super().__init__()
+
+        self.cfg, cfg_train = parse_configs()
+        
+        current_case_name = self.cfg.image_input.split("/")[-1]
+        self.cfg.image_dump = "/data1/users/adrian/LHM/exps/images/" + current_case_name
+
+
+        configure_logger(
+            stream_level=self.cfg.logger,
+            log_level=self.cfg.logger,
+        )  # logger function
+
+        # if do not download prior model, we automatically download them.
+        prior_check()
+
+        self.facedetect = FaceDetector(
+            "./pretrained_models/gagatracker/vgghead/vgg_heads_l.trcd",
+            device=avaliable_device(),
+        )
+        self.pose_estimator = FullPoseEstimator(
+            "./pretrained_models/human_model_files/", device=avaliable_device()
+        )
+        try:
+            self.parsingnet = SAM2Seg()
+        except:
+            self.parsingnet = None 
+
+        self.model: ModelHumanLRMSapdinoBodyHeadSD3_5 = self._build_model(self.cfg).to(self.device)
+        self.motion_dict = dict()
+
+    def _build_model(self, cfg):
+        from LHM.models import model_dict
+
+        hf_model_cls = wrap_model_hub(model_dict[self.EXP_TYPE])
+        print("model name:", cfg.model_name)
+        
+        model = hf_model_cls.from_pretrained(cfg.model_name,strict=False)
+        return model
+
+    def _default_source_camera(
+        self,
+        dist_to_center: float = 2.0,
+        batch_size: int = 1,
+        device: torch.device = torch.device("cpu"),
+    ):
+        # return: (N, D_cam_raw)
+        canonical_camera_extrinsics = torch.tensor(
+            [
+                [
+                    [1, 0, 0, 0],
+                    [0, 0, -1, -dist_to_center],
+                    [0, 1, 0, 0],
+                ]
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+        canonical_camera_intrinsics = create_intrinsics(
+            f=0.75,
+            c=0.5,
+            device=device,
+        ).unsqueeze(0)
+        source_camera = build_camera_principle(
+            canonical_camera_extrinsics, canonical_camera_intrinsics
+        )
+        return source_camera.repeat(batch_size, 1)
+
+    def _default_render_cameras(
+        self,
+        n_views: int,
+        batch_size: int = 1,
+        device: torch.device = torch.device("cpu"),
+    ):
+        # return: (N, M, D_cam_render)
+        render_camera_extrinsics = surrounding_views_linspace(
+            n_views=n_views, device=device
+        )
+        render_camera_intrinsics = (
+            create_intrinsics(
+                f=0.75,
+                c=0.5,
+                device=device,
+            )
+            .unsqueeze(0)
+            .repeat(render_camera_extrinsics.shape[0], 1, 1)
+        )
+        render_cameras = build_camera_standard(
+            render_camera_extrinsics, render_camera_intrinsics
+        )
+        return render_cameras.unsqueeze(0).repeat(batch_size, 1, 1)
+
+    def infer_video(
+        self,
+        planes: torch.Tensor,
+        frame_size: int,
+        render_size: int,
+        render_views: int,
+        render_fps: int,
+        dump_video_path: str,
+    ):
+        N = planes.shape[0]
+        render_cameras = self._default_render_cameras(
+            n_views=render_views, batch_size=N, device=self.device
+        )
+        render_anchors = torch.zeros(N, render_cameras.shape[1], 2, device=self.device)
+        render_resolutions = (
+            torch.ones(N, render_cameras.shape[1], 1, device=self.device) * render_size
+        )
+        render_bg_colors = (
+            torch.ones(
+                N, render_cameras.shape[1], 1, device=self.device, dtype=torch.float32
+            )
+            * 1.0
+        )
+
+        frames = []
+        for i in range(0, render_cameras.shape[1], frame_size):
+            frames.append(
+                self.model.synthesizer(
+                    planes=planes,
+                    cameras=render_cameras[:, i : i + frame_size],
+                    anchors=render_anchors[:, i : i + frame_size],
+                    resolutions=render_resolutions[:, i : i + frame_size],
+                    bg_colors=render_bg_colors[:, i : i + frame_size],
+                    region_size=render_size,
+                )
+            )
+        # merge frames
+        frames = {k: torch.cat([r[k] for r in frames], dim=1) for k in frames[0].keys()}
+        # dump
+        os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
+        for k, v in frames.items():
+            if k == "images_rgb":
+                images_to_video(
+                    images=v[0],
+                    output_path=dump_video_path,
+                    fps=render_fps,
+                    gradio_codec=self.cfg.app_enabled,
+                )
+
+    def crop_face_image(self, image_path):
+        rgb = np.array(Image.open(image_path))
+        rgb = torch.from_numpy(rgb).permute(2, 0, 1)
+        bbox = self.facedetect(rgb)
+        head_rgb = rgb[:, int(bbox[1]) : int(bbox[3]), int(bbox[0]) : int(bbox[2])]
+        head_rgb = head_rgb.permute(1, 2, 0)
+        head_rgb = head_rgb.cpu().numpy()
+        return head_rgb
+
+    @torch.no_grad()
+    def parsing(self, img_path):
+
+        parsing_out = self.parsingnet(img_path=img_path, bbox=None)
+        alpha = (parsing_out.masks * 255).astype(np.uint8)
+
+        return alpha
+
+    def fix_rotations(self,
+        canonical_gs_attributes: dict,
+        betas: torch.Tensor,
+        transform_mat_neutral_pose: torch.Tensor,
+    ) -> dict:
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        smplx_model = SMPLXVoxelMeshModel(
+            human_model_path='./pretrained_models/human_model_files',
+            gender="neutral",
+            subdivide_num=1,
+            shape_param_dim=10,
+            expr_param_dim=100,
+            cano_pose_type=1,
+            body_face_ratio=3,
+            dense_sample_points=40000,
+            apply_pose_blendshape=False,
+        ).to(device)
+
+        batch_size = betas.shape[0]
+        cano_body_pose = torch.zeros(batch_size, 21, 3, device=device)
+        cano_body_pose[:, 15, -1] = -math.pi / 6
+        cano_body_pose[:, 16, -1] = +math.pi / 6
+
+        smplx_data_cano = {
+            'betas': betas,
+            'body_pose': torch.zeros(batch_size, 21, 3, device=device), #cano_body_pose,
+            'root_pose': torch.zeros(batch_size, 1, 3, device=device),
+            'lhand_pose': torch.zeros(batch_size, 15, 3, device=device),
+            'rhand_pose': torch.zeros(batch_size, 15, 3, device=device),
+            'jaw_pose': torch.zeros(batch_size, 1, 3, device=device),
+            'leye_pose': torch.zeros(batch_size, 1, 3, device=device),
+            'reye_pose': torch.zeros(batch_size, 1, 3, device=device),
+            'expr': torch.zeros(batch_size, 100, device=device),
+            'trans': torch.zeros(batch_size, 3, device=device),
+        }
+
+        with torch.autocast(device_type=device.type, dtype=torch.float32):
+            canonical_means = canonical_gs_attributes['means3D']
+
+            verts_to_deform = canonical_means.unsqueeze(0)
+
+            posed_means, transform_matrix = smplx_model.transform_to_posed_verts_from_neutral_pose(
+                verts_to_deform,
+                smplx_data_cano,
+                None,
+                transform_mat_neutral_pose=transform_mat_neutral_pose,
+                device=device,
+            )
+
+            transform_rotation = transform_matrix[:, :, :3, :3]
+            rigid_rotation_quaternion = matrix_to_quaternion(transform_rotation)
+            
+            is_constrain_body = smplx_model.is_constrain_body
+            identity_quaternion = matrix_to_quaternion(torch.eye(3, device=device))
+            rigid_rotation_quaternion[:, is_constrain_body] = identity_quaternion
+
+            canonical_rotation = canonical_gs_attributes['rotations'].unsqueeze(0)
+            posed_rotation = quaternion_multiply(rigid_rotation_quaternion, canonical_rotation)
+        
+        output_data = {
+            "means3D": posed_means.squeeze(0),
+            "opacities": canonical_gs_attributes['opacities'],
+            "scales": canonical_gs_attributes['scales'],
+            "rotations": posed_rotation.squeeze(0),
+            "shs": canonical_gs_attributes['shs']
+        }
+
+        return output_data
+
+    def infer_single(
+        self,
+        image_path: str,
+        shape_param,
+    ):
+        source_size = self.cfg.source_size
+        aspect_standard = 5.0 / 3
+
+        if self.parsingnet is not None:
+            parsing_mask = self.parsing(image_path)
+        else:
+            img_np = cv2.imread(image_path)
+            remove_np = remove(img_np)
+            parsing_mask = remove_np[...,3]
+        
+        # prepare reference image
+        image, _, _ = infer_preprocess_image(
+            image_path,
+            mask=parsing_mask,
+            intr=None,
+            pad_ratio=0,
+            bg_color=1.0,
+            max_tgt_size=896,
+            aspect_standard=aspect_standard,
+            enlarge_ratio=[1.0, 1.0],
+            render_tgt_size=source_size,
+            multiply=14,
+            need_mask=True,
+        )
+        try:
+            src_head_rgb = self.crop_face_image(image_path)
+        except:
+            print("w/o head input!")
+            src_head_rgb = np.zeros((112, 112, 3), dtype=np.uint8)
+
+
+        try:
+            src_head_rgb = cv2.resize(
+                src_head_rgb,
+                dsize=(self.cfg.src_head_size, self.cfg.src_head_size),
+                interpolation=cv2.INTER_AREA,
+            )  # resize to dino size
+        except:
+            src_head_rgb = np.zeros(
+                (self.cfg.src_head_size, self.cfg.src_head_size, 3), dtype=np.uint8
+            )
+
+        src_head_rgb = (
+            torch.from_numpy(src_head_rgb / 255.0).float().permute(2, 0, 1).unsqueeze(0)
+        )  # [1, 3, H, W]
+
+        # read motion seq
+        device = "cuda"
+        dtype = torch.float32
+        shape_param = torch.tensor(shape_param, dtype=dtype).unsqueeze(0)
+
+        self.model.to(dtype)
+        smplx_params = {'betas': shape_param.to(device)}
+        gs_model_list, query_points, transform_mat_neutral_pose = self.model.infer_single_view(
+            image.unsqueeze(0).to(device, dtype),
+            src_head_rgb.unsqueeze(0).to(device, dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            smplx_params=smplx_params,
+        )  
+
+        gaussian_data = {}
+        gaussian_data["means3D"] = gs_model_list[0].offset_xyz + query_points.squeeze(0)  # [Nv, 3]
+        gaussian_data["opacities"] = gs_model_list[0].opacity
+        gaussian_data["shs"] = gs_model_list[0].shs
+        gaussian_data["scales"] = gs_model_list[0].scaling
+        gaussian_data["rotations"] = gs_model_list[0].rotation  
+        gaussian_data = self.fix_rotations(gaussian_data, shape_param, transform_mat_neutral_pose)
+        return gaussian_data, query_points
+
+    def render_avatar(self, gaussian_data, camera_data, smplx_params, save_path=None):
+        means3D_canon = gaussian_data["means3D"].to(self.device)
+        rotations_quat_canon = gaussian_data["rotations"].to(self.device)
+        scales = gaussian_data["scales"].to(self.device)
+        opacities = gaussian_data["opacities"].to(self.device)
+        colors = gaussian_data["shs"].squeeze(1).to(self.device)
+        
+        global_rotvec = smplx_params['root_pose']
+        trans_vec = smplx_params['trans'].to(self.device)
+
+        R_world_matrix_np = R.from_rotvec(global_rotvec.cpu().numpy()).as_matrix()
+        R_world_matrix = torch.from_numpy(R_world_matrix_np).float().to(self.device)
+        
+        posed_means3D = means3D_canon @ R_world_matrix.T + trans_vec
+        
+        num_gaussians = means3D_canon.shape[0]
+        transform_rotation = R_world_matrix.unsqueeze(0).expand(num_gaussians, 3, 3)
+
+        deformation_quats = matrix_to_quaternion(transform_rotation)
+        
+        posed_rotations_quat = quaternion_multiply(
+            deformation_quats, 
+            rotations_quat_canon
+        )
+
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(camera_data["height"]),
+            image_width=int(camera_data["width"]),
+            tanfovx=camera_data["tanfovx"],
+            tanfovy=camera_data["tanfovy"],
+            bg=torch.ones(3, dtype=torch.float32, device=self.device),
+            scale_modifier=1.0,
+            viewmatrix=torch.eye(4, device=self.device),
+            projmatrix=camera_data["proj_matrix"].to(self.device),
+            sh_degree=3,
+            campos=torch.zeros(3, device=self.device),
+            prefiltered=False,
+            debug=False,
+        )
+        rasterizer = GaussianRasterizer(raster_settings)
+
+        with torch.no_grad():
+            rendered_image, _, _, _ = rasterizer(
+                means3D=posed_means3D,
+                means2D=torch.zeros_like(posed_means3D),
+                opacities=opacities,
+                shs=None,
+                colors_precomp=colors,
+                scales=scales,  
+                rotations=posed_rotations_quat,
+            )
+
+        if save_path is not None:
+            # Guardar la imagen renderizada
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            img_to_save = (rendered_image.clamp(0.0, 1.0) * 255).to(torch.uint8).cpu().numpy()
+            img_to_save = img_to_save.transpose(1, 2, 0)
+            img_to_save = cv2.cvtColor(img_to_save, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(save_path, img_to_save)
+
+            ply_path = save_path.replace(".png", ".ply")
+            try:
+                import open3d as o3d
+                point_cloud = o3d.geometry.PointCloud()
+                means3D_np = posed_means3D.cpu().numpy()
+                point_cloud.points = o3d.utility.Vector3dVector(means3D_np)
+                point_cloud.colors = o3d.utility.Vector3dVector(colors.cpu().numpy())
+                o3d.io.write_point_cloud(ply_path, point_cloud)
+                print(f"Saved rendered image to {save_path} and point cloud to {ply_path}")
+            except ImportError:
+                 print(f"Saved rendered image to {save_path}. Open3D not installed, skipping point cloud save.")
+                
+        return rendered_image
+    
+    def save_final_pth(self, final_avatar, betas, query_points, save_path):
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        smplx_model = SMPLXVoxelMeshModel(
+            human_model_path='./pretrained_models/human_model_files',
+            gender="neutral",
+            subdivide_num=1,
+            shape_param_dim=10,
+            expr_param_dim=100,
+            cano_pose_type=1,
+            body_face_ratio=3,
+            dense_sample_points=40000,
+            apply_pose_blendshape=False,
+        ).to(device)
+
+        final_pth1 = {
+            "opacity": final_avatar["opacities"],
+            "means3D": final_avatar["means3D"],
+            "means3D_offsets": final_avatar["means3D"] - query_points,
+            "query_points": query_points,
+            "scales": final_avatar["scales"],
+            "rotation": final_avatar["rotations"],
+            "shs": final_avatar["shs"],
+        }
+
+        final_pth2 = smplx_model.get_smplx_features(final_avatar["means3D"],
+                                                    betas)
+
+        torch.save({**final_pth1, **final_pth2}, save_path)
+        print(f"Final avatar pth saved to {save_path}")
+
+
+
+    def infer(self):
+
+        image_paths = []
+        if os.path.isfile(self.cfg.image_input):
+            image_paths.append(self.cfg.image_input)
+        else:
+            suffixes = (".jpg", ".jpeg", ".png", ".webp", ".JPG")
+            for root, dirs, files in os.walk(self.cfg.image_input):
+                for file in files:
+                    if file.endswith(suffixes):
+                        image_paths.append(os.path.join(root, file))
+            image_paths.sort()
+
+        image_paths = image_paths[
+            self.accelerator.process_index :: self.accelerator.num_processes
+        ]
+
+        gaussaians_data_list = []
+        camera_data_list = []
+        smplx_params_list = []
+
+        for idx, image_path in tqdm(enumerate(image_paths),disable=not self.accelerator.is_local_main_process):
+            pose_out = self.pose_estimator(image_path)
+            camera_data = pose_out.camera_data
+            smplx_params = pose_out.smplx_params
+            assert pose_out.ratio>0.4, f"body ratio is too small: {pose_out.ratio}"
+            gaussian_data, query_points = self.infer_single(
+                image_path,
+                shape_param=smplx_params["betas"],
+            )
+
+            # this render is just for debugging
+            self.render_avatar(
+                gaussian_data,
+                camera_data,
+                smplx_params,
+                save_path=os.path.join(
+                    self.cfg.image_dump, "rendered", f"{idx:05d}.png"
+                ),
+            )
+
+
+            gaussaians_data_list.append(gaussian_data)
+            camera_data_list.append(camera_data)
+            smplx_params_list.append(smplx_params)
+
+        final_avatar = merge_avatars(gaussaians_data_list, camera_data_list)
+        for i in range(len(image_paths)):
+            os.makedirs(os.path.join(self.cfg.image_dump, "final_avatar"), exist_ok=True)
+            rendered_path = os.path.join(
+                self.cfg.image_dump, "final_avatar", f"{i:05d}.png"
+            )
+            self.render_avatar(
+                final_avatar,
+                camera_data_list[i],
+                smplx_params_list[i],
+                save_path=rendered_path,
+            )
+
+        final_avatar_path = os.path.join(self.cfg.image_dump, "lhm_output_data.pth")
+        self.save_final_pth(final_avatar,smplx_params["betas"], query_points, final_avatar_path)
+  
+        
+
+
+

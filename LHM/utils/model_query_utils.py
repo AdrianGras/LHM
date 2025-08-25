@@ -16,6 +16,7 @@ except ImportError:
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', package_name])
     print(f"{package_name} has been successfully installed.")
     import GPUtil 
+import os
 
 
 class AutoModelSwitcher:
@@ -52,7 +53,8 @@ class AutoModelSwitcher:
         else:
             self.get_memory = get_memory_func
         
-        self.available_mb = self._default_memory_check()
+        gpu_id = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+        self.available_mb = self._default_memory_check(gpu_id=gpu_id)
 
     def _default_memory_check(self, gpu_id=0):
         """Check available GPU memory using GPUtil.
@@ -130,3 +132,4 @@ class AutoModelSwitcher:
         """
         available_mb = self.available_mb - self.extra_memory
         return [name for name, req in self.sorted_models if req <= available_mb]
+    
